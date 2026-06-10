@@ -1,3 +1,35 @@
+// =============================================================================
+// Veracode Security Pipeline for Jenkins - Windows Multibranch Version
+// =============================================================================
+//
+// Tested target:
+//   https://github.com/veracode/verademo
+//   Maven POM: app/pom.xml
+//   WAR output: app/target/verademo.war
+//
+// Required Jenkins credentials:
+//   - veracode-api-id        Secret text -> Veracode API ID
+//   - veracode-api-key       Secret text -> Veracode API Key
+//
+// Optional environment variables:
+//   - VERACODE_APP_NAME      Override app profile name
+//                            If unset, defaults to owner/repo from Git remote URL
+//                            Example: ancient-cthulhu/verademo
+//   - MAVEN_POM_PATH         Default: app/pom.xml
+//   - VERACODE_SOURCE_DIR    Default: app
+//
+// Branch strategy:
+//   feature/*       -> Pipeline Scan, no gate
+//   pull request    -> Pipeline Scan with Very High / High gate
+//   release/*       -> Veracode Sandbox Scan
+//   main            -> Veracode Policy Scan
+//
+// Notes:
+//   - This version is Windows-native and uses PowerShell.
+//   - This is designed for a Jenkins Multibranch Pipeline.
+//   - Use checkout scm, not hardcoded git branch checkout.
+// =============================================================================
+
 pipeline {
     agent any
 
@@ -6,6 +38,11 @@ pipeline {
         timeout(time: 2, unit: 'HOURS')
         buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
         disableConcurrentBuilds()
+
+        // Important for Multibranch Pipeline:
+        // Jenkins otherwise performs an automatic checkout before stages.
+        // We do our own explicit checkout in the Checkout stage.
+        skipDefaultCheckout(true)
     }
 
     environment {
@@ -17,19 +54,83 @@ pipeline {
 
         stage('Checkout') {
             steps {
-                git branch: 'main', url: 'https://github.com/ancient-cthulhu/verademo.git'
-        
+                checkout scm
+
                 powershell '''
+                    $ErrorActionPreference = "Stop"
+
                     Write-Host "Repository contents:"
                     Get-ChildItem -Force
-        
+
                     Write-Host ""
+                    Write-Host "Branch:       $env:BRANCH_NAME"
+                    Write-Host "Change ID:    $env:CHANGE_ID"
                     Write-Host "Build number: $env:BUILD_NUMBER"
                     Write-Host "Workspace:    $env:WORKSPACE"
+
+                    Write-Host ""
+                    Write-Host "Git remote:"
+                    git config --get remote.origin.url
                 '''
             }
         }
 
+        stage('Resolve Veracode App Name') {
+            steps {
+                script {
+                    def overrideName = env.VERACODE_APP_NAME?.trim()
+
+                    if (overrideName) {
+                        env.VERACODE_APP_NAME_RESOLVED = overrideName
+                        echo "Veracode Application Profile override: ${overrideName}"
+                    } else {
+                        def repoUrl = env.GIT_URL ?: env.GIT_URL_1 ?: ""
+
+                        if (!repoUrl?.trim()) {
+                            repoUrl = powershell(
+                                returnStdout: true,
+                                script: '''
+                                    $ErrorActionPreference = "Stop"
+                                    git config --get remote.origin.url
+                                '''
+                            ).trim()
+                        }
+
+                        def cleaned = repoUrl.trim()
+
+                        // Remove protocol and optional embedded credentials.
+                        cleaned = cleaned.replaceFirst(/^https?:\\/\\/([^@\\/]+@)?/, "")
+
+                        // Convert SSH style:
+                        // git@github.com:owner/repo.git -> github.com:owner/repo.git
+                        cleaned = cleaned.replaceFirst(/^git@/, "")
+
+                        // Remove host prefix:
+                        // github.com/owner/repo.git -> owner/repo.git
+                        // github.com:owner/repo.git -> owner/repo.git
+                        cleaned = cleaned.replaceFirst(/^[^:\\/]+[:\\/]/, "")
+
+                        // Remove trailing .git
+                        cleaned = cleaned.replaceFirst(/\\.git$/, "")
+
+                        def parts = cleaned.tokenize("/")
+                        def appName
+
+                        if (parts.size() >= 2) {
+                            def owner = parts[parts.size() - 2]
+                            def repo = parts[parts.size() - 1]
+                            appName = "${owner}/${repo}"
+                        } else {
+                            appName = env.JOB_NAME
+                            echo "WARNING: Could not parse owner/repo from Git URL '${repoUrl}'. Falling back to JOB_NAME: ${appName}"
+                        }
+
+                        env.VERACODE_APP_NAME_RESOLVED = appName
+                        echo "Veracode Application Profile: ${appName}"
+                    }
+                }
+            }
+        }
 
         stage('Build (Maven)') {
             steps {
@@ -53,14 +154,9 @@ pipeline {
 
         stage('Package Artifacts') {
             steps {
-                script {
-                    def appName = env.VERACODE_APP_NAME?.trim() ?: env.JOB_NAME
-                    env.VERACODE_APP_NAME_RESOLVED = appName
-                    echo "Veracode Application Profile: ${appName}"
-                }
-
                 powershell '''
                     $ErrorActionPreference = "Stop"
+                    $ProgressPreference = "SilentlyContinue"
 
                     $env:VERACODE_API_KEY_ID = $env:VERACODE_API_ID
                     $env:VERACODE_API_KEY_SECRET = $env:VERACODE_API_KEY
@@ -70,8 +166,13 @@ pipeline {
                     $sourceDir = if ($env:VERACODE_SOURCE_DIR) { $env:VERACODE_SOURCE_DIR } else { "app" }
 
                     Write-Host "Installing Veracode CLI..."
-                    Invoke-WebRequest -Uri "https://tools.veracode.com/veracode-cli/install.ps1" -OutFile "install.ps1"
-                    powershell -NoProfile -ExecutionPolicy Bypass -File ".\\install.ps1"
+
+                    if (!(Test-Path "$env:USERPROFILE\\.veracode-cli\\veracode.exe")) {
+                        & curl.exe -fsSL "https://tools.veracode.com/veracode-cli/install.ps1" -o "install.ps1"
+                        powershell -NoProfile -ExecutionPolicy Bypass -File ".\\install.ps1"
+                    } else {
+                        Write-Host "Veracode CLI already exists at $env:USERPROFILE\\.veracode-cli\\veracode.exe"
+                    }
 
                     $env:Path += ";$env:USERPROFILE\\.veracode-cli"
 
@@ -96,7 +197,13 @@ pipeline {
                         Write-Error "No packaged artifacts found"
                     }
 
-                    $artifacts.FullName | Out-File -FilePath artifact_list.txt -Encoding utf8
+                    $workspace = (Get-Location).Path
+
+                    $relativeArtifacts = $artifacts | ForEach-Object {
+                        $_.FullName.Substring($workspace.Length + 1)
+                    }
+
+                    $relativeArtifacts | Out-File -FilePath artifact_list.txt -Encoding utf8
 
                     Write-Host "Artifacts found:"
                     Get-Content artifact_list.txt
@@ -109,6 +216,7 @@ pipeline {
                 success {
                     stash name: 'verascan-bundle',
                           includes: 'verascan/**,artifact_list.txt,app_name.txt'
+
                     archiveArtifacts artifacts: 'artifact_list.txt', allowEmptyArchive: true
                 }
             }
@@ -120,7 +228,7 @@ pipeline {
                 stage('Agent-Based SCA') {
                     steps {
                         echo "Skipping Agent-Based SCA in this Windows-native version."
-                        echo "The original SourceClear ci.sh script is Linux/macOS shell-based, not Windows-native."
+                        echo "The original SourceClear ci.sh script is Linux/macOS shell-based."
                     }
                 }
 
@@ -137,9 +245,11 @@ pipeline {
 
                         powershell '''
                             $ErrorActionPreference = "Stop"
+                            $ProgressPreference = "SilentlyContinue"
 
                             Write-Host "Downloading Veracode Pipeline Scanner..."
-                            Invoke-WebRequest -Uri "https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip" -OutFile "pipeline-scan-LATEST.zip"
+                            & curl.exe -fsSL "https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip" -o "pipeline-scan-LATEST.zip"
+
                             Expand-Archive -Path "pipeline-scan-LATEST.zip" -DestinationPath "." -Force
 
                             if (!(Test-Path "pipeline-scan.jar")) {
@@ -202,9 +312,11 @@ pipeline {
 
                         powershell '''
                             $ErrorActionPreference = "Stop"
+                            $ProgressPreference = "SilentlyContinue"
 
                             Write-Host "Downloading Veracode Pipeline Scanner..."
-                            Invoke-WebRequest -Uri "https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip" -OutFile "pipeline-scan-LATEST.zip"
+                            & curl.exe -fsSL "https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip" -o "pipeline-scan-LATEST.zip"
+
                             Expand-Archive -Path "pipeline-scan-LATEST.zip" -DestinationPath "." -Force
 
                             if (!(Test-Path "pipeline-scan.jar")) {
@@ -279,11 +391,17 @@ pipeline {
 
                         powershell '''
                             $ErrorActionPreference = "Stop"
+                            $ProgressPreference = "SilentlyContinue"
 
                             Write-Host "Downloading Veracode Java API Wrapper..."
                             New-Item -ItemType Directory -Force -Path ".veracode" | Out-Null
 
-                            [xml]$metadata = (Invoke-WebRequest -Uri "https://repo1.maven.org/maven2/com/veracode/vosp/api/wrappers/vosp-api-wrappers-java/maven-metadata.xml").Content
+                            $metadataUrl = "https://repo1.maven.org/maven2/com/veracode/vosp/api/wrappers/vosp-api-wrappers-java/maven-metadata.xml"
+                            $metadataFile = ".veracode\\maven-metadata.xml"
+
+                            & curl.exe -fsSL $metadataUrl -o $metadataFile
+
+                            [xml]$metadata = Get-Content $metadataFile
                             $version = $metadata.metadata.versioning.latest
 
                             if (!$version) {
@@ -294,7 +412,8 @@ pipeline {
 
                             $wrapperUrl = "https://repo1.maven.org/maven2/com/veracode/vosp/api/wrappers/vosp-api-wrappers-java/$version/vosp-api-wrappers-java-$version-dist.zip"
 
-                            Invoke-WebRequest -Uri $wrapperUrl -OutFile ".veracode\\dist.zip"
+                            & curl.exe -fsSL $wrapperUrl -o ".veracode\\dist.zip"
+
                             Expand-Archive -Path ".veracode\\dist.zip" -DestinationPath ".veracode" -Force
 
                             $jar = Get-ChildItem -Path ".veracode" -Recurse -File -Filter "VeracodeJavaAPI*.jar" | Select-Object -First 1
@@ -341,11 +460,17 @@ pipeline {
 
                         powershell '''
                             $ErrorActionPreference = "Stop"
+                            $ProgressPreference = "SilentlyContinue"
 
                             Write-Host "Downloading Veracode Java API Wrapper..."
                             New-Item -ItemType Directory -Force -Path ".veracode" | Out-Null
 
-                            [xml]$metadata = (Invoke-WebRequest -Uri "https://repo1.maven.org/maven2/com/veracode/vosp/api/wrappers/vosp-api-wrappers-java/maven-metadata.xml").Content
+                            $metadataUrl = "https://repo1.maven.org/maven2/com/veracode/vosp/api/wrappers/vosp-api-wrappers-java/maven-metadata.xml"
+                            $metadataFile = ".veracode\\maven-metadata.xml"
+
+                            & curl.exe -fsSL $metadataUrl -o $metadataFile
+
+                            [xml]$metadata = Get-Content $metadataFile
                             $version = $metadata.metadata.versioning.latest
 
                             if (!$version) {
@@ -356,7 +481,8 @@ pipeline {
 
                             $wrapperUrl = "https://repo1.maven.org/maven2/com/veracode/vosp/api/wrappers/vosp-api-wrappers-java/$version/vosp-api-wrappers-java-$version-dist.zip"
 
-                            Invoke-WebRequest -Uri $wrapperUrl -OutFile ".veracode\\dist.zip"
+                            & curl.exe -fsSL $wrapperUrl -o ".veracode\\dist.zip"
+
                             Expand-Archive -Path ".veracode\\dist.zip" -DestinationPath ".veracode" -Force
 
                             $jar = Get-ChildItem -Path ".veracode" -Recurse -File -Filter "VeracodeJavaAPI*.jar" | Select-Object -First 1
