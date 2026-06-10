@@ -17,7 +17,7 @@ pipeline {
 
         stage('Checkout') {
             steps {
-                git branch: 'main', url: 'https://github.com/veracode/verademo.git'
+                git branch: 'main', url: 'https://github.com/ancient-cthulhu/verademo.git'
         
                 powershell '''
                     Write-Host "Repository contents:"
